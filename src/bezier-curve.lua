@@ -1993,8 +1993,28 @@ local function finishSession(canUndo)
     pcall(function() app.layer = s.layer end)
     pcall(function() app.frame = s.frameNumber end)
 
+    -- Cels copied from this one while it was edited (e.g. dragged with Alt in
+    -- the timeline, which runs no command) got the points and handles shown
+    -- in it. They are found by their pixels, and get the lines below.
+    local copies, shown = {}, nil
+    if s.ov and #s.paths > 0 then
+      local o, source = s.ov, s.layer:cel(s.frameNumber)
+      shown = o.img.bytes
+      eachCurveCel(s.sprite, function(c)
+        if c ~= source and c.position.x == o.x and c.position.y == o.y
+           and c.image.width == o.w and c.image.height == o.h and c.image.bytes == shown then
+          copies[#copies + 1] = c
+        end
+      end)
+    end
+
     -- Put the pixels back as they were before the lines were shown
     if s.ov then pcall(restoreOverlay, s.ov) end
+    -- Linked cels share the pixels, so they were put back too: not copies.
+    -- Nothing to do either if no guides were shown.
+    for i = #copies, 1, -1 do
+      if copies[i].image.bytes ~= shown or s.ov.img.bytes == shown then table.remove(copies, i) end
+    end
 
     -- If the undo history was moved (e.g. in the Undo History panel), leave it as it is
     if not s.historyMoved then
@@ -2002,7 +2022,7 @@ local function finishSession(canUndo)
       if s.setup and canUndo and not s.externalChange then
         app.command.Undo()   -- the setup step is still the last one
       end
-      if result ~= s.original then
+      if result ~= s.original or #copies > 0 then
         app.transaction(T.title, function()
           pcall(colorCurveLayer, s.layer)   -- curve layers made before layers had a color
           local c = s.layer:cel(s.frameNumber)
@@ -2019,6 +2039,11 @@ local function finishSession(canUndo)
               c = s.sprite:newCel(s.layer, s.frameNumber, img, Point(0, 0))
             end
             c.properties(KEY, { version = 2, paths = result })
+          end
+          for _, copy in ipairs(copies) do
+            copy.image = renderPaths(s.sprite, parse(result))
+            copy.position = Point(0, 0)
+            copy.properties(KEY, { version = 2, paths = result })
           end
         end)
       end
