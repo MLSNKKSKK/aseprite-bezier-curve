@@ -821,6 +821,61 @@ local function compareWithLines(sprite, cel, paths)
   return true, cel.position.x + cb.x - db.x, cel.position.y + cb.y - db.y
 end
 
+-- Aseprite copies cels (e.g. with New Frame, or dragging a cel with Alt in
+-- the timeline) without their lines. Such a copy still shows exactly what
+-- the lines of the cel it came from draw, so it is found by its pixels.
+
+-- The visible pixels of an image, to compare images wherever they were moved.
+-- With `like` (the visible pixels of another image), only returns them if
+-- they cover an area of the same size (a quick check before copying them).
+local function visibleBytes(img, like)
+  local b = img:shrinkBounds()
+  if isEmptyRect(b) then return nil end
+  if like and (b.width ~= like.width or b.height ~= like.height) then return nil end
+  return Image(img, b).bytes, b
+end
+
+local function eachCurveCel(sprite, fn)
+  local function scan(layers)
+    for _, l in ipairs(layers) do
+      if l.isGroup then
+        scan(l.layers)
+      elseif isCurveLayer(l) then
+        for _, c in ipairs(l.cels) do fn(c) end
+      end
+    end
+  end
+  scan(sprite.layers)
+end
+
+-- The lines of another curve cel that draw exactly what `cel` shows, or nil
+local function linesOfCopy(sprite, cel)
+  local bytes, area = visibleBytes(cel.image)
+  if not bytes then return nil end
+  local found
+  eachCurveCel(sprite, function(c)
+    if found or c == cel then return end
+    local data = c.properties(KEY)
+    if type(data.paths) ~= "string" or visibleBytes(c.image, area) ~= bytes then return end
+    local paths = parse(data.paths)
+    if compareWithLines(sprite, cel, paths) then found = paths end
+  end)
+  return found
+end
+
+-- Gives the lines `text` to the copies of `source` that don't hold lines of
+-- their own, so they can still be edited after `source` changes.
+local function giveLinesToCopies(sprite, source, text)
+  local bytes, area = visibleBytes(renderPaths(sprite, parse(text)))
+  if not bytes then return end
+  eachCurveCel(sprite, function(c)
+    if c == source or visibleBytes(c.image, area) ~= bytes then return end
+    local data = c.properties(KEY)
+    if type(data.paths) == "string" and compareWithLines(sprite, c, parse(data.paths)) then return end
+    c.properties(KEY, { version = 2, paths = text })
+  end)
+end
+
 local function newLayerName(sprite)
   local used = {}
   local function scan(layers)
@@ -1828,9 +1883,21 @@ local function startSession(force)
   local paths, original = {}, ""
   if cel then
     local data = cel.properties(KEY)
-    if type(data.paths) == "string" then
+    local hasLines = type(data.paths) == "string"
+    local same, dx, dy
+    if hasLines then
       paths = parse(data.paths)
-      local same, dx, dy = compareWithLines(sprite, cel, paths)
+      same, dx, dy = compareWithLines(sprite, cel, paths)
+    end
+    if not same and not cel.image:isEmpty() then
+      -- A copy of another curve cel: edit it with that cel's lines
+      local found = linesOfCopy(sprite, cel)
+      if found then
+        paths, hasLines = found, true
+        same, dx, dy = compareWithLines(sprite, cel, paths)
+      end
+    end
+    if hasLines then
       if same then
         -- If the cel was moved (e.g. with the Move tool), move the lines with it
         local function shift(pv) return pv and { x = pv.x + dx, y = pv.y + dy } end
@@ -1926,8 +1993,28 @@ local function finishSession(canUndo)
     pcall(function() app.layer = s.layer end)
     pcall(function() app.frame = s.frameNumber end)
 
+    -- Cels copied from this one while it was edited (e.g. dragged with Alt in
+    -- the timeline, which runs no command) got the points and handles shown
+    -- in it. They are found by their pixels, and get the lines below.
+    local copies, shown = {}, nil
+    if s.ov and #s.paths > 0 then
+      local o, source = s.ov, s.layer:cel(s.frameNumber)
+      shown = o.img.bytes
+      eachCurveCel(s.sprite, function(c)
+        if c ~= source and c.position.x == o.x and c.position.y == o.y
+           and c.image.width == o.w and c.image.height == o.h and c.image.bytes == shown then
+          copies[#copies + 1] = c
+        end
+      end)
+    end
+
     -- Put the pixels back as they were before the lines were shown
     if s.ov then pcall(restoreOverlay, s.ov) end
+    -- Linked cels share the pixels, so they were put back too: not copies.
+    -- Nothing to do either if no guides were shown.
+    for i = #copies, 1, -1 do
+      if copies[i].image.bytes ~= shown or s.ov.img.bytes == shown then table.remove(copies, i) end
+    end
 
     -- If the undo history was moved (e.g. in the Undo History panel), leave it as it is
     if not s.historyMoved then
@@ -1935,10 +2022,12 @@ local function finishSession(canUndo)
       if s.setup and canUndo and not s.externalChange then
         app.command.Undo()   -- the setup step is still the last one
       end
-      if result ~= s.original then
+      if result ~= s.original or #copies > 0 then
         app.transaction(T.title, function()
           pcall(colorCurveLayer, s.layer)   -- curve layers made before layers had a color
           local c = s.layer:cel(s.frameNumber)
+          -- Copies of this cel keep the lines it had
+          if s.original and s.original ~= "" then giveLinesToCopies(s.sprite, c, s.original) end
           if #s.paths == 0 then
             if c then s.sprite:deleteCel(c) end
           else
@@ -1950,6 +2039,11 @@ local function finishSession(canUndo)
               c = s.sprite:newCel(s.layer, s.frameNumber, img, Point(0, 0))
             end
             c.properties(KEY, { version = 2, paths = result })
+          end
+          for _, copy in ipairs(copies) do
+            copy.image = renderPaths(s.sprite, parse(result))
+            copy.position = Point(0, 0)
+            copy.properties(KEY, { version = 2, paths = result })
           end
         end)
       end
